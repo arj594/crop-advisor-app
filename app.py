@@ -12,7 +12,11 @@ def generate_pdf_report(
     district, season, soil_ph, nitrogen, phosphorus, potassium,
     rainfall, temperature, best_crop, confidence,
     top3_crops, top3_probs, feature_names, importances,
-    adv_title, adv_body
+    adv_title, adv_body,
+    # ── NEW: uncertainty / robustness params ──
+    reliability_label="—", raw_entropy=0.0, norm_entropy=0.0,
+    robustness_score=0.0, climate_sensitivity="—",
+    risk_level="—", risk_flags=None
 ):
     from reportlab.lib.pagesizes import A4
     from reportlab.lib import colors
@@ -114,7 +118,7 @@ def generate_pdf_report(
         [Paragraph(f"{icon}  Recommended Crop", S("rl",
             fontSize=10, fontName="Helvetica",
             textColor=colors.HexColor("#a5d6a7"))),
-         Paragraph("Confidence Score", S("rc",
+         Paragraph("Adaptive AI Confidence Score", S("rc",
             fontSize=10, fontName="Helvetica",
             textColor=colors.HexColor("#a5d6a7"), alignment=TA_RIGHT))],
         [Paragraph(best_crop, S("rn",
@@ -141,6 +145,70 @@ def generate_pdf_report(
         ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
     ]))
     story.append(result_table)
+    story.append(Spacer(1, 16))
+
+    # ══════════════════════════════════════════════════════════════
+    # UNCERTAINTY & ROBUSTNESS ANALYSIS TABLE  (NEW SECTION)
+    # ══════════════════════════════════════════════════════════════
+    story.append(Paragraph("Uncertainty & Robustness Analysis", s_section))
+    story.append(HRFlowable(width="100%", thickness=1, color=GREEN_LIGHT, spaceAfter=6))
+
+    risk_flags = risk_flags or []
+    risk_flag_text = "; ".join([f[2] for f in risk_flags]) if risk_flags else "None"
+
+    uncertainty_rows = [
+        ["Metric", "Value", "Interpretation"],
+        ["Adaptive AI Confidence Score",
+         f"{confidence:.1f}%",
+         "High (>80%), Moderate (60–80%), Low (<60%)"],
+        ["Prediction Reliability",
+         reliability_label,
+         "Derived from Shannon entropy of class probabilities"],
+        ["Predictive Entropy (raw)",
+         f"{raw_entropy:.4f} nats",
+         "Low = model certain; High = model uncertain"],
+        ["Normalised Entropy",
+         f"{norm_entropy:.3f}",
+         "0 = fully certain, 1 = maximally uncertain"],
+        ["Robustness Score",
+         f"{robustness_score*100:.0f}%",
+         "% of trials with same prediction under climate perturbation"],
+        ["Climate Sensitivity",
+         climate_sensitivity,
+         "Impact of rainfall/temperature variation on recommendation"],
+        ["Overall Risk Level",
+         risk_level,
+         "Composite of confidence + robustness flags"],
+        ["Active Risk Flags",
+         risk_flag_text,
+         "Warnings triggered by threshold analysis"],
+    ]
+
+    def reliability_bg(label):
+        m = {"High": colors.HexColor("#e8f5e9"),
+             "Medium": colors.HexColor("#fff9c4"),
+             "Low": colors.HexColor("#ffebee")}
+        return m.get(label, WHITE)
+
+    unc_table = Table(uncertainty_rows, colWidths=[5*cm, 3*cm, 9*cm])
+    unc_style = [
+        ("BACKGROUND",    (0,0), (-1,0), colors.HexColor("#1a237e")),
+        ("TEXTCOLOR",     (0,0), (-1,0), WHITE),
+        ("FONTNAME",      (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE",      (0,0), (-1,-1), 8.5),
+        ("FONTNAME",      (0,1), (-1,-1), "Helvetica"),
+        ("TEXTCOLOR",     (0,1), (-1,-1), BLACK),
+        ("ROWBACKGROUNDS",(0,1), (-1,-1), [WHITE, GRAY_LIGHT]),
+        ("GRID",          (0,0), (-1,-1), 0.3, colors.HexColor("#ccc")),
+        ("TOPPADDING",    (0,0), (-1,-1), 5),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+        ("LEFTPADDING",   (0,0), (-1,-1), 8),
+        ("RIGHTPADDING",  (0,0), (-1,-1), 8),
+        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
+        ("FONTNAME",      (1,1), (1,-1), "Helvetica-Bold"),
+    ]
+    unc_table.setStyle(TableStyle(unc_style))
+    story.append(unc_table)
     story.append(Spacer(1, 16))
 
     # ══════════════════════════════════════════════════════════════
@@ -225,7 +293,7 @@ def generate_pdf_report(
     # ══════════════════════════════════════════════════════════════
     # FEATURE IMPORTANCE TABLE
     # ══════════════════════════════════════════════════════════════
-    story.append(Paragraph("Model Feature Importance Analysis", s_section))
+    story.append(Paragraph("Explainable AI Analysis — Feature Importance", s_section))
     story.append(HRFlowable(width="100%", thickness=1, color=GREEN_LIGHT, spaceAfter=6))
 
     label_map = {
@@ -362,7 +430,7 @@ def generate_pdf_report(
 
 # ─── PAGE CONFIG ─────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Smart Crop Advisor · AP",
+    page_title="Adaptive Crop Recommendation · AP",
     page_icon="🌱",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -464,6 +532,51 @@ label, p, .stMarkdown p { color: #d9efd2 !important; }
 /* ── Section divider ── */
 .sdiv { border: none; border-top: 1px solid rgba(255,255,255,0.1); margin: 1rem 0; }
 
+/* ── Project subtitle ── */
+.project-subtitle {
+    font-size: 0.85rem;
+    color: #81c784 !important;
+    letter-spacing: 0.04em;
+    margin: 6px 0 10px 0;
+    font-style: italic;
+}
+
+/* ── Metric cards row (uncertainty / robustness) ── */
+.metric-cards-row { display: flex; gap: 12px; margin: 1rem 0; flex-wrap: wrap; }
+.metric-card {
+    flex: 1; min-width: 140px;
+    background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.14);
+    border-radius: 12px; padding: 0.9rem 1rem;
+    backdrop-filter: blur(4px);
+}
+.metric-card .mc-icon  { font-size: 1.3rem; margin-bottom: 4px; }
+.metric-card .mc-label { font-size: 0.68rem; color: #81c784 !important; text-transform: uppercase; letter-spacing: 0.08em; }
+.metric-card .mc-value { font-size: 1.15rem; font-weight: 700; color: #ffffff !important; margin-top: 2px; }
+.metric-card .mc-sub   { font-size: 0.72rem; color: #a5d6a7 !important; margin-top: 2px; }
+
+/* ── Entropy / reliability panel ── */
+.entropy-panel {
+    background: rgba(30,60,100,0.35);
+    border: 1px solid rgba(100,160,255,0.3);
+    border-radius: 12px; padding: 1rem 1.25rem; margin: 0.5rem 0;
+}
+.entropy-panel .ep-title { font-size: 0.72rem; color: #90caf9 !important; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
+.entropy-panel .ep-score { font-size: 1.6rem; font-weight: 800; color: #fff !important; }
+.entropy-panel .ep-label { font-size: 0.82rem; color: #90caf9 !important; margin-top: 2px; }
+
+/* ── Risk warning banners ── */
+.risk-banner { border-radius: 10px; padding: 0.75rem 1.1rem; margin: 6px 0; display: flex; align-items: flex-start; gap: 10px; }
+.risk-banner.risk-low-conf  { background: rgba(183,28,28,0.25); border: 1px solid rgba(229,115,115,0.5); }
+.risk-banner.risk-climate   { background: rgba(230,81,0,0.25);  border: 1px solid rgba(255,183,77,0.5); }
+.risk-banner .rb-icon  { font-size: 1.1rem; margin-top: 1px; }
+.risk-banner .rb-title { font-size: 0.82rem; font-weight: 700; color: #fff !important; }
+.risk-banner .rb-body  { font-size: 0.77rem; color: rgba(255,255,255,0.75) !important; margin-top: 2px; line-height: 1.4; }
+
+/* ── Robustness bar ── */
+.robust-bar-wrap { background: rgba(255,255,255,0.1); border-radius: 999px; height: 10px; margin: 6px 0 2px; overflow: hidden; }
+.robust-bar-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, #ef9a9a, #a5d6a7); transition: width 0.6s; }
+
 /* ── Streamlit widget overrides ── */
 .stSelectbox > div > div { background: rgba(255,255,255,0.08) !important; border: 1px solid rgba(255,255,255,0.2) !important; border-radius: 8px !important; color: #fff !important; }
 .stButton > button {
@@ -538,12 +651,18 @@ CROP_ICONS = {"Rice":"🌾","Cotton":"🌿","Chilli":"🌶️","Maize":"🌽","G
 
 
 # ─── HEADER ──────────────────────────────────────────────────────────────────
-st.markdown("# 🌱 Smart Crop Recommendation System")
+st.markdown("# 🌱 An Adaptive, Uncertainty-Aware Decision Framework for Intelligent Crop Recommendation Under Dynamic Agricultural Conditions")
+st.markdown(
+    '<p class="project-subtitle">Adaptive AI &nbsp;•&nbsp; Uncertainty-Aware Prediction &nbsp;•&nbsp; Explainable Recommendation System</p>',
+    unsafe_allow_html=True
+)
 st.markdown(
     '<span class="project-badge">B.Tech Final Year</span>'
     '<span class="project-badge">CSE Core</span>'
     '<span class="project-badge">SDP Final Review</span>'
-    '<span class="project-badge">XGBoost + SMOTE</span>',
+    '<span class="project-badge">XGBoost + SMOTE</span>'
+    '<span class="project-badge">Uncertainty-Aware</span>'
+    '<span class="project-badge">Explainable AI</span>',
     unsafe_allow_html=True
 )
 
@@ -581,6 +700,84 @@ with right:
     predict_btn = st.button("🚀  Predict Best Crop", use_container_width=True)
 
 
+# ─── UNCERTAINTY / ENTROPY HELPER ───────────────────────────────────────────
+def compute_entropy(probs):
+    """Shannon entropy over class probabilities.
+    Low entropy  → model is certain  → High reliability
+    High entropy → model is spread   → Low reliability
+    Max possible entropy for N classes = log(N)
+    """
+    eps = 1e-12                          # avoid log(0)
+    raw = -np.sum(probs * np.log(probs + eps))
+    n_classes = len(probs)
+    max_entropy = np.log(n_classes)      # normalise to [0,1]
+    normalised  = raw / max_entropy if max_entropy > 0 else 0.0
+    return round(raw, 4), round(normalised, 4)
+
+def entropy_to_reliability(normalised_entropy):
+    """Convert normalised entropy → reliability label + colour."""
+    if normalised_entropy < 0.35:
+        return "High",   "#4caf50"    # green
+    elif normalised_entropy < 0.65:
+        return "Medium", "#ffa726"    # amber
+    else:
+        return "Low",    "#ef5350"    # red
+
+
+# ─── ROBUSTNESS / CLIMATE SENSITIVITY HELPER ────────────────────────────────
+def compute_robustness(model, base_input_df, le_district, le_season,
+                       best_crop, le_crop, n_trials=20):
+    """Lightweight counterfactual robustness test.
+    Perturbs rainfall (±10 %) and temperature (±2 °C) n_trials times,
+    re-runs prediction each time, and returns the fraction of trials
+    where the top-recommended crop stays the same.
+    """
+    rng  = np.random.default_rng(seed=42)
+    same = 0
+    rain_val = float(base_input_df["Rainfall"].iloc[0])
+    temp_val = float(base_input_df["Temperature"].iloc[0])
+
+    for _ in range(n_trials):
+        perturbed = base_input_df.copy()
+        perturbed["Rainfall"]    = rain_val * (1 + rng.uniform(-0.10, 0.10))
+        perturbed["Temperature"] = temp_val + rng.uniform(-2.0,  2.0)
+        trial_probs = model.predict_proba(perturbed)[0]
+        trial_best  = le_crop.inverse_transform([np.argmax(trial_probs)])[0]
+        if trial_best == best_crop:
+            same += 1
+
+    robustness = same / n_trials           # 0.0 – 1.0
+    # Climate sensitivity: inverse of robustness
+    if robustness >= 0.85:
+        climate_sens = "Low"
+    elif robustness >= 0.65:
+        climate_sens = "Moderate"
+    else:
+        climate_sens = "High"
+    return round(robustness, 4), climate_sens
+
+
+# ─── RISK FLAG HELPER ────────────────────────────────────────────────────────
+def get_risk_flags(confidence_pct, robustness_score):
+    """Return list of active risk flags as (css_class, icon, title, body)."""
+    flags = []
+    if confidence_pct < 40:
+        flags.append((
+            "risk-low-conf", "⚠️",
+            "Low Confidence Recommendation",
+            f"Model confidence is {confidence_pct:.1f}% — below the 40% reliability threshold. "
+            "Consider verifying with local agricultural experts before acting."
+        ))
+    if robustness_score < 0.75:
+        flags.append((
+            "risk-climate", "🌡️",
+            "Prediction Sensitive to Climate Changes",
+            f"Robustness score is {robustness_score*100:.0f}% — recommendation may change "
+            "with moderate rainfall or temperature variation. Plan for contingency crops."
+        ))
+    return flags
+
+
 # ─── PREDICTION ──────────────────────────────────────────────────────────────
 if predict_btn:
     inp = pd.DataFrame([{
@@ -604,6 +801,27 @@ if predict_btn:
     adv_title, adv_body = ADVISORIES.get(best_crop,
         ("Follow standard practices","Consult your local agricultural extension officer."))
 
+    # ── Uncertainty analysis ──
+    raw_entropy, norm_entropy = compute_entropy(probs)
+    reliability_label, reliability_color = entropy_to_reliability(norm_entropy)
+
+    # ── Robustness testing (lightweight, 20 trials) ──
+    robustness_score, climate_sensitivity = compute_robustness(
+        model, inp, le_district, le_season, best_crop, le_crop, n_trials=20
+    )
+    robustness_pct = robustness_score * 100
+
+    # ── Risk flags ──
+    risk_flags = get_risk_flags(confidence, robustness_score)
+
+    # ── Derived risk level label ──
+    if len(risk_flags) == 0:
+        risk_level, risk_color = "Low Risk",    "#4caf50"
+    elif len(risk_flags) == 1:
+        risk_level, risk_color = "Medium Risk", "#ffa726"
+    else:
+        risk_level, risk_color = "High Risk",   "#ef5350" 
+
     st.markdown('<hr class="sdiv">', unsafe_allow_html=True)
     st.markdown("## Recommendation Results")
 
@@ -623,7 +841,7 @@ if predict_btn:
         <div style="margin-top:8px">{conf_badge}</div>
       </div>
       <div>
-        <div class="conf-lbl">Confidence Score</div>
+        <div class="conf-lbl">Adaptive AI Confidence Score</div>
         <div class="conf-pct">{confidence:.1f}%</div>
         <div class="conf-lbl">{district} · {season}</div>
       </div>
@@ -641,6 +859,50 @@ if predict_btn:
         f'<span class="metric-pill">💧 {irrigation}</span>',
         unsafe_allow_html=True
     )
+
+    st.write("")
+
+    # ── Uncertainty & Robustness Metric Cards ──────────────────────────────────
+    st.markdown(f"""
+    <div class="metric-cards-row">
+      <div class="metric-card">
+        <div class="mc-icon">🎯</div>
+        <div class="mc-label">Prediction Reliability</div>
+        <div class="mc-value" style="color:{reliability_color} !important">{reliability_label}</div>
+        <div class="mc-sub">Entropy: {raw_entropy:.4f} nats</div>
+      </div>
+      <div class="metric-card">
+        <div class="mc-icon">🌡️</div>
+        <div class="mc-label">Climate Sensitivity</div>
+        <div class="mc-value">{climate_sensitivity}</div>
+        <div class="mc-sub">Rainfall &amp; Temp perturbation</div>
+      </div>
+      <div class="metric-card">
+        <div class="mc-icon">⚡</div>
+        <div class="mc-label">Risk Level</div>
+        <div class="mc-value" style="color:{risk_color} !important">{risk_level}</div>
+        <div class="mc-sub">{len(risk_flags)} active flag(s)</div>
+      </div>
+      <div class="metric-card">
+        <div class="mc-icon">🛡️</div>
+        <div class="mc-label">Robustness Score</div>
+        <div class="mc-value">{robustness_pct:.0f}%</div>
+        <div class="mc-sub">{int(robustness_pct*0.2)}/20 stable trials</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Risk Warning Banners (shown only when triggered) ───────────────────────
+    for css_cls, rb_icon, rb_title, rb_body in risk_flags:
+        st.markdown(f"""
+        <div class="risk-banner {css_cls}">
+          <div class="rb-icon">{rb_icon}</div>
+          <div>
+            <div class="rb-title">{rb_title}</div>
+            <div class="rb-body">{rb_body}</div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
 
     st.write("")
 
@@ -663,7 +925,7 @@ if predict_btn:
                      caption=f"{best_crop} crop — Andhra Pradesh")
 
     with c2:
-        st.markdown("#### 📊 Feature Importance")
+        st.markdown("#### 🔬 Explainable AI Analysis")
         importance = model.feature_importances_
         label_map = {
             "Soil_pH":"Soil pH","Nitrogen":"Nitrogen","Phosphorus":"Phosphorus",
@@ -679,6 +941,15 @@ if predict_btn:
         top3_feat = feat_df["Feature"].head(3).tolist()
         st.caption(f"Key drivers: **{', '.join(top3_feat)}**")
 
+        # Entropy detail under chart
+        st.markdown(f"""
+        <div class="entropy-panel">
+          <div class="ep-title">&#x1F4CA; Predictive Entropy (Uncertainty Measure)</div>
+          <div class="ep-score">{raw_entropy:.4f} <span style="font-size:0.9rem;font-weight:400">nats</span></div>
+          <div class="ep-label">Normalised: {norm_entropy:.3f} &nbsp;|&nbsp; Reliability: <b>{reliability_label}</b></div>
+        </div>
+        """, unsafe_allow_html=True)
+
     with c3:
         st.markdown("#### 🌾 Why This Crop?")
         st.markdown(f"""
@@ -689,6 +960,21 @@ if predict_btn:
         """, unsafe_allow_html=True)
 
         st.write("")
+
+        # Robustness bar
+        st.markdown(f"""
+        <div style="margin-bottom:8px">
+          <div style="font-size:0.72rem;color:#81c784;text-transform:uppercase;letter-spacing:0.08em">
+            &#x1F6E1; Robustness Score
+          </div>
+          <div class="robust-bar-wrap">
+            <div class="robust-bar-fill" style="width:{robustness_pct:.0f}%"></div>
+          </div>
+          <div style="font-size:0.78rem;color:#a5d6a7">{robustness_pct:.0f}% stable across climate perturbations
+          &nbsp;|&nbsp; Climate sensitivity: <b>{climate_sensitivity}</b></div>
+        </div>
+        """, unsafe_allow_html=True)
+
         # Full probability expander
         with st.expander("📋 All crops probability table"):
             all_crops = le_crop.classes_
@@ -708,10 +994,18 @@ if predict_btn:
         district, season, soil_ph, nitrogen, phosphorus, potassium,
         rainfall, temperature, best_crop, confidence,
         top3_crops, top3_probs, feature_names, model.feature_importances_,
-        adv_title, adv_body
+        adv_title, adv_body,
+        # uncertainty / robustness params
+        reliability_label=reliability_label,
+        raw_entropy=raw_entropy,
+        norm_entropy=norm_entropy,
+        robustness_score=robustness_score,
+        climate_sensitivity=climate_sensitivity,
+        risk_level=risk_level,
+        risk_flags=risk_flags,
     )
 
-    fname = f"CropAdvisor_{best_crop}_{district}_{season}_{datetime.now().strftime('%d%b%Y')}.pdf"
+    fname = f"AdaptiveCropReport_{best_crop}_{district}_{season}_{datetime.now().strftime('%d%b%Y')}.pdf"
     dl_col, info_col = st.columns([1, 2])
     with dl_col:
         st.download_button(
@@ -724,8 +1018,8 @@ if predict_btn:
     with info_col:
         st.markdown(
             f'<p style="color:#a5d6a7;font-size:0.82rem;padding-top:12px">'
-            f'Full report includes: input parameters, top 3 recommendations, '
-            f'feature importance table, agronomic advisory, and model details.<br>'
+            f'Full report includes: input parameters, uncertainty analysis, '
+            f'robustness scores, explainable AI section, advisory, and model details.<br>'
             f'Filename: <code style="color:#81c784">{fname}</code></p>',
             unsafe_allow_html=True
         )
@@ -735,8 +1029,8 @@ st.markdown(
     "<hr style='border-color:rgba(255,255,255,0.1)'>"
     "<p style='text-align:center;font-size:0.75rem;color:rgba(255,255,255,0.4)'>"
     "B.Tech Final Year Project · CSE Core · SDP Final Review &nbsp;|&nbsp; "
-    "Powered by XGBoost · SMOTE · Streamlit · ReportLab &nbsp;|&nbsp; "
-    "For advisory use only — verify with local agricultural extension officer"
+    "Adaptive AI · Uncertainty-Aware · Explainable Recommendation System &nbsp;|&nbsp; "
+    "Recommendation generated using adaptive machine learning analysis."
     "</p>",
     unsafe_allow_html=True
 )
