@@ -156,56 +156,55 @@ def generate_pdf_report(
     risk_flags = risk_flags or []
     risk_flag_text = "; ".join([f[2] for f in risk_flags]) if risk_flags else "None"
 
+    # Helper: wrap every cell in Paragraph so text auto-wraps instead of overflowing
+    def _P(text, bold=False, color=BLACK, size=8.5):
+        return Paragraph(str(text), ParagraphStyle(
+            "cell", fontSize=size, fontName="Helvetica-Bold" if bold else "Helvetica",
+            textColor=color, leading=11, wordWrap="LTR"
+        ))
+
+    HDR = colors.HexColor("#1a237e")
     uncertainty_rows = [
-        ["Metric", "Value", "Interpretation"],
-        ["Adaptive AI Confidence Score",
-         f"{confidence:.1f}%",
-         "High (>80%), Moderate (60–80%), Low (<60%)"],
-        ["Prediction Reliability",
-         reliability_label,
-         "Derived from Shannon entropy of class probabilities"],
-        ["Predictive Entropy (raw)",
-         f"{raw_entropy:.4f} nats",
-         "Low = model certain; High = model uncertain"],
-        ["Normalised Entropy",
-         f"{norm_entropy:.3f}",
-         "0 = fully certain, 1 = maximally uncertain"],
-        ["Robustness Score",
-         f"{robustness_score*100:.0f}%",
-         "% of trials with same prediction under climate perturbation"],
-        ["Climate Sensitivity",
-         climate_sensitivity,
-         "Impact of rainfall/temperature variation on recommendation"],
-        ["Overall Risk Level",
-         risk_level,
-         "Composite of confidence + robustness flags"],
-        ["Active Risk Flags",
-         risk_flag_text,
-         "Warnings triggered by threshold analysis"],
+        [_P("Metric",                     bold=True, color=WHITE, size=8.5),
+         _P("Value",                      bold=True, color=WHITE, size=8.5),
+         _P("Interpretation",             bold=True, color=WHITE, size=8.5)],
+        [_P("Adaptive AI Confidence Score"),
+         _P(f"{confidence:.1f}%",         bold=True),
+         _P("High (>80%), Moderate (60–80%), Low (<60%)")],
+        [_P("Prediction Reliability"),
+         _P(reliability_label,            bold=True),
+         _P("Derived from Shannon entropy of class probabilities")],
+        [_P("Predictive Entropy (raw)"),
+         _P(f"{raw_entropy:.4f} nats",    bold=True),
+         _P("Low entropy = model is certain; High entropy = model is uncertain")],
+        [_P("Normalised Entropy"),
+         _P(f"{norm_entropy:.3f}",        bold=True),
+         _P("0 = fully certain,  1 = maximally uncertain")],
+        [_P("Robustness Score"),
+         _P(f"{robustness_score*100:.0f}%", bold=True),
+         _P("% of 20 trials where top crop stayed the same under climate perturbation")],
+        [_P("Climate Sensitivity"),
+         _P(climate_sensitivity,          bold=True),
+         _P("Sensitivity of recommendation to rainfall and temperature variation")],
+        [_P("Overall Risk Level"),
+         _P(risk_level,                   bold=True),
+         _P("Composite of confidence score + robustness flags")],
+        [_P("Active Risk Flags"),
+         _P(risk_flag_text,               bold=True),
+         _P("Warnings triggered by threshold analysis")],
     ]
 
-    def reliability_bg(label):
-        m = {"High": colors.HexColor("#e8f5e9"),
-             "Medium": colors.HexColor("#fff9c4"),
-             "Low": colors.HexColor("#ffebee")}
-        return m.get(label, WHITE)
-
-    unc_table = Table(uncertainty_rows, colWidths=[5*cm, 3*cm, 9*cm])
+    unc_table = Table(uncertainty_rows, colWidths=[5*cm, 3.2*cm, 8.8*cm],
+                      repeatRows=1)          # repeat header on page break
     unc_style = [
-        ("BACKGROUND",    (0,0), (-1,0), colors.HexColor("#1a237e")),
-        ("TEXTCOLOR",     (0,0), (-1,0), WHITE),
-        ("FONTNAME",      (0,0), (-1,0), "Helvetica-Bold"),
-        ("FONTSIZE",      (0,0), (-1,-1), 8.5),
-        ("FONTNAME",      (0,1), (-1,-1), "Helvetica"),
-        ("TEXTCOLOR",     (0,1), (-1,-1), BLACK),
+        ("BACKGROUND",    (0,0), (-1,0), HDR),
         ("ROWBACKGROUNDS",(0,1), (-1,-1), [WHITE, GRAY_LIGHT]),
         ("GRID",          (0,0), (-1,-1), 0.3, colors.HexColor("#ccc")),
-        ("TOPPADDING",    (0,0), (-1,-1), 5),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 5),
+        ("TOPPADDING",    (0,0), (-1,-1), 6),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 6),
         ("LEFTPADDING",   (0,0), (-1,-1), 8),
         ("RIGHTPADDING",  (0,0), (-1,-1), 8),
-        ("VALIGN",        (0,0), (-1,-1), "MIDDLE"),
-        ("FONTNAME",      (1,1), (1,-1), "Helvetica-Bold"),
+        ("VALIGN",        (0,0), (-1,-1), "TOP"),   # TOP so wrapped lines align
     ]
     unc_table.setStyle(TableStyle(unc_style))
     story.append(unc_table)
