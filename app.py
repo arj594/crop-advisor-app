@@ -1,3 +1,4 @@
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,6 +7,402 @@ from xgboost import XGBClassifier
 from imblearn.over_sampling import SMOTE
 import io
 from datetime import datetime
+"""
+multi_agent.py  —  Yield Agent · Risk Agent · Market Agent · Fusion Rule
+Four-module decision layer that wraps XGBoost predictions with
+domain-specific intelligence and a weighted fusion rule.
+"""
+
+import numpy as np
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  KNOWLEDGE BASES  (static, no external calls needed — self-contained)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Expected yield range (quintal/acre) per crop per season
+YIELD_KB = {
+    "Rice":      {"Kharif": (18, 28), "Rabi": (20, 30), "Zaid": (15, 22)},
+    "Cotton":    {"Kharif": ( 6, 10), "Rabi": ( 5,  8), "Zaid": ( 4,  7)},
+    "Chilli":    {"Kharif": ( 8, 14), "Rabi": (10, 16), "Zaid": ( 6, 10)},
+    "Maize":     {"Kharif": (16, 24), "Rabi": (18, 26), "Zaid": (14, 20)},
+    "Groundnut": {"Kharif": ( 8, 13), "Rabi": ( 9, 14), "Zaid": ( 7, 11)},
+}
+
+# Soil-pH suitability window per crop
+PH_WINDOW = {
+    "Rice":      (5.5, 7.0),
+    "Cotton":    (6.0, 8.0),
+    "Chilli":    (5.5, 7.0),
+    "Maize":     (5.8, 7.5),
+    "Groundnut": (5.5, 6.5),
+}
+
+# Optimal NPK range (kg/ha) per crop
+NPK_OPTIMA = {
+    "Rice":      {"N": (80, 120), "P": (40, 60),  "K": (40, 60)},
+    "Cotton":    {"N": (60, 100), "P": (30, 50),  "K": (30, 60)},
+    "Chilli":    {"N": (60, 100), "P": (40, 60),  "K": (40, 60)},
+    "Maize":     {"N": (80, 120), "P": (40, 60),  "K": (30, 50)},
+    "Groundnut": {"N": (20,  40), "P": (40, 60),  "K": (40, 60)},
+}
+
+# Rainfall tolerance window (mm / season) per crop
+RAIN_WINDOW = {
+    "Rice":      (800, 1200),
+    "Cotton":    (500,  900),
+    "Chilli":    (500,  800),
+    "Maize":     (500,  900),
+    "Groundnut": (400,  700),
+}
+
+# Temperature tolerance (°C) per crop
+TEMP_WINDOW = {
+    "Rice":      (22, 35),
+    "Cotton":    (21, 38),
+    "Chilli":    (20, 35),
+    "Maize":     (18, 33),
+    "Groundnut": (20, 35),
+}
+
+# ── Market KB: MSP (₹/quintal) + demand trend + price volatility
+MARKET_KB = {
+    "Rice":      {"mspp": 2183, "demand": "High",   "volatility": "Low",      "export_potential": "Medium"},
+    "Cotton":    {"mspp": 6620, "demand": "High",   "volatility": "High",     "export_potential": "High"},
+    "Chilli":    {"mspp": 3000, "demand": "Medium", "volatility": "Very High","export_potential": "High"},
+    "Maize":     {"mspp": 1962, "demand": "Medium", "volatility": "Low",      "export_potential": "Medium"},
+    "Groundnut": {"mspp": 5850, "demand": "Medium", "volatility": "Medium",   "export_potential": "Medium"},
+}
+
+# ── Risk KB: common pest/disease + natural disaster sensitivity
+RISK_KB = {
+    "Rice":      {"primary_pest": "Stem Borer, Blast",          "flood_risk": "High",   "drought_risk": "Low",    "ipm_difficulty": "Medium"},
+    "Cotton":    {"primary_pest": "Bollworm, Whitefly",         "flood_risk": "Low",    "drought_risk": "High",   "ipm_difficulty": "High"},
+    "Chilli":    {"primary_pest": "Thrips, Anthracnose",        "flood_risk": "Medium", "drought_risk": "Medium", "ipm_difficulty": "High"},
+    "Maize":     {"primary_pest": "Fall Armyworm, Stem Borer",  "flood_risk": "Medium", "drought_risk": "Medium", "ipm_difficulty": "Medium"},
+    "Groundnut": {"primary_pest": "Leaf Miner, Collar Rot",     "flood_risk": "Low",    "drought_risk": "High",   "ipm_difficulty": "Low"},
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPER: score a numeric input vs an (low, high) optimal window  → 0‥1
+# ══════════════════════════════════════════════════════════════════════════════
+def _window_score(val, lo, hi):
+    """Returns 1.0 if val is inside [lo, hi], tapers linearly outside."""
+    if lo <= val <= hi:
+        return 1.0
+    margin = (hi - lo) * 0.5
+    if val < lo:
+        return max(0.0, 1.0 - (lo - val) / max(margin, 1))
+    return max(0.0, 1.0 - (val - hi) / max(margin, 1))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AGENT 1 — YIELD AGENT
+#  Estimates expected yield, soil-suitability, & growth-factor scores
+# ══════════════════════════════════════════════════════════════════════════════
+def yield_agent(crop, season, soil_ph, nitrogen, phosphorus,
+                potassium, rainfall, temperature):
+    """
+    Returns a dict with:
+      yield_lo, yield_hi   — expected quintal/acre range
+      yield_score          — 0‥1 overall yield suitability
+      soil_ph_ok           — bool
+      npk_score            — 0‥1
+      climate_score        — 0‥1
+      factors              — list of (label, score, emoji) for display
+    """
+    # Soil pH
+    ph_lo, ph_hi = PH_WINDOW.get(crop, (5.5, 7.5))
+    ph_score = _window_score(soil_ph, ph_lo, ph_hi)
+    soil_ph_ok = (ph_lo <= soil_ph <= ph_hi)
+
+    # NPK
+    npk = NPK_OPTIMA.get(crop, {"N": (60, 100), "P": (30, 50), "K": (30, 50)})
+    n_score = _window_score(nitrogen,   *npk["N"])
+    p_score = _window_score(phosphorus, *npk["P"])
+    k_score = _window_score(potassium,  *npk["K"])
+    npk_score = (n_score + p_score + k_score) / 3
+
+    # Climate
+    r_lo, r_hi = RAIN_WINDOW.get(crop, (500, 900))
+    t_lo, t_hi = TEMP_WINDOW.get(crop, (20, 35))
+    rain_score = _window_score(rainfall,    r_lo, r_hi)
+    temp_score = _window_score(temperature, t_lo, t_hi)
+    climate_score = (rain_score + temp_score) / 2
+
+    # Composite yield score
+    yield_score = round(0.30 * ph_score + 0.35 * npk_score + 0.35 * climate_score, 3)
+
+    # Yield range — scale by yield_score
+    y_kb = YIELD_KB.get(crop, {})
+    base_lo, base_hi = y_kb.get(season, y_kb.get("Kharif", (10, 20)))
+    adj_lo = round(base_lo * (0.7 + 0.3 * yield_score), 1)
+    adj_hi = round(base_hi * (0.7 + 0.3 * yield_score), 1)
+
+    factors = [
+        ("Soil pH",      round(ph_score * 100),      "🧪"),
+        ("Nitrogen",     round(n_score  * 100),      "🌿"),
+        ("Phosphorus",   round(p_score  * 100),      "⚗️"),
+        ("Potassium",    round(k_score  * 100),      "🔋"),
+        ("Rainfall",     round(rain_score * 100),    "🌧️"),
+        ("Temperature",  round(temp_score * 100),    "🌡️"),
+    ]
+
+    return {
+        "yield_lo":      adj_lo,
+        "yield_hi":      adj_hi,
+        "yield_score":   yield_score,
+        "soil_ph_ok":    soil_ph_ok,
+        "npk_score":     round(npk_score, 3),
+        "climate_score": round(climate_score, 3),
+        "factors":       factors,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AGENT 2 — RISK AGENT
+#  Evaluates pest, flood, drought and input-cost risk
+# ══════════════════════════════════════════════════════════════════════════════
+def risk_agent(crop, rainfall, temperature, robustness_score):
+    """
+    Returns:
+      risk_score     — 0‥1  (higher = riskier)
+      risk_grade     — "Low" / "Moderate" / "High" / "Very High"
+      pest_warnings  — list of str
+      risk_factors   — list of (label, level, emoji)
+    """
+    kb = RISK_KB.get(crop, {})
+
+    # Flood risk from actual rainfall
+    r_hi = RAIN_WINDOW.get(crop, (500, 900))[1]
+    flood_score = min(1.0, max(0.0, (rainfall - r_hi) / 300)) if rainfall > r_hi else 0.0
+
+    # Drought risk
+    r_lo = RAIN_WINDOW.get(crop, (500, 900))[0]
+    drought_score = min(1.0, max(0.0, (r_lo - rainfall) / 200)) if rainfall < r_lo else 0.0
+
+    # Pest risk — higher temp & humidity (rainfall proxy) → more pest pressure
+    t_hi = TEMP_WINDOW.get(crop, (20, 35))[1]
+    pest_score = min(1.0, max(0.0, (temperature - (t_hi - 4)) / 4))
+    if rainfall > 700:
+        pest_score = min(1.0, pest_score + 0.2)
+
+    # Climate robustness risk (inverse)
+    stability_risk = round(1.0 - robustness_score, 3)
+
+    # Composite
+    risk_score = round(
+        0.30 * pest_score +
+        0.25 * flood_score +
+        0.20 * drought_score +
+        0.25 * stability_risk, 3
+    )
+
+    if risk_score < 0.25:
+        risk_grade = "Low"
+    elif risk_score < 0.50:
+        risk_grade = "Moderate"
+    elif risk_score < 0.75:
+        risk_grade = "High"
+    else:
+        risk_grade = "Very High"
+
+    pest_warnings = []
+    if pest_score > 0.4:
+        pest_warnings.append(f"Elevated pest pressure — monitor for {kb.get('primary_pest','common pests')}")
+    if flood_score > 0.3:
+        pest_warnings.append("Above-optimal rainfall — waterlogging / fungal disease risk")
+    if drought_score > 0.3:
+        pest_warnings.append("Below-optimal rainfall — moisture stress / irrigation needed")
+    if stability_risk > 0.35:
+        pest_warnings.append("Prediction instability under climate variation — consider contingency crop")
+
+    risk_factors = [
+        ("Pest Pressure",      _level(pest_score),      "🐛"),
+        ("Flood Risk",         kb.get("flood_risk",   "Medium"), "🌊"),
+        ("Drought Risk",       kb.get("drought_risk", "Medium"), "☀️"),
+        ("Climate Stability",  _level(stability_risk),  "🌪️"),
+        ("IPM Difficulty",     kb.get("ipm_difficulty","Medium"),"🔬"),
+    ]
+
+    return {
+        "risk_score":    risk_score,
+        "risk_grade":    risk_grade,
+        "pest_warnings": pest_warnings,
+        "risk_factors":  risk_factors,
+    }
+
+
+def _level(score):
+    if score < 0.25: return "Low"
+    if score < 0.50: return "Moderate"
+    if score < 0.75: return "High"
+    return "Very High"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  AGENT 3 — MARKET AGENT
+#  Evaluates MSP, price volatility, demand outlook, revenue estimate
+# ══════════════════════════════════════════════════════════════════════════════
+def market_agent(crop, yield_lo, yield_hi):
+    """
+    Returns:
+      mspp           — Minimum Support Price ₹/quintal
+      demand         — str
+      volatility     — str
+      export_potential — str
+      revenue_lo     — ₹ estimated (yield_lo × msp)
+      revenue_hi     — ₹ estimated (yield_hi × msp)
+      market_score   — 0‥1 (higher = better market opportunity)
+      market_insight — str
+    """
+    kb = MARKET_KB.get(crop, {"mspp": 2000, "demand": "Medium",
+                               "volatility": "Medium", "export_potential": "Medium"})
+    mspp = kb["mspp"]
+    demand = kb["demand"]
+    vol = kb["volatility"]
+    export = kb["export_potential"]
+
+    # Revenue estimate per acre
+    revenue_lo = round(yield_lo * mspp)
+    revenue_hi = round(yield_hi * mspp)
+
+    # Market score
+    demand_s   = {"High": 1.0, "Medium": 0.6, "Low": 0.3}.get(demand, 0.5)
+    vol_s      = {"Low": 1.0, "Medium": 0.7, "High": 0.4, "Very High": 0.2}.get(vol, 0.5)
+    export_s   = {"High": 1.0, "Medium": 0.6, "Low": 0.3}.get(export, 0.5)
+    market_score = round((demand_s + vol_s + export_s) / 3, 3)
+
+    # Text insight
+    if market_score >= 0.75:
+        insight = "Strong market outlook — high demand, stable prices, good export potential."
+    elif market_score >= 0.50:
+        insight = "Moderate market outlook — demand is acceptable, monitor price trends before selling."
+    else:
+        insight = "Cautious market outlook — high price volatility; consider contract farming or staggered sale."
+
+    return {
+        "mspp":             mspp,
+        "demand":           demand,
+        "volatility":       vol,
+        "export_potential": export,
+        "revenue_lo":       revenue_lo,
+        "revenue_hi":       revenue_hi,
+        "market_score":     market_score,
+        "market_insight":   insight,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  FUSION RULE
+#  Weighted combination of ML confidence + Yield + Risk + Market scores
+#  → Final Composite Decision Score + Natural-language verdict
+# ══════════════════════════════════════════════════════════════════════════════
+FUSION_WEIGHTS = {
+    "ml_confidence": 0.35,   # XGBoost model confidence
+    "yield_score":   0.30,   # Yield Agent
+    "market_score":  0.20,   # Market Agent
+    "risk_penalty":  0.15,   # Risk Agent (inverted — lower risk = higher score)
+}
+
+def fusion_rule(ml_confidence_pct, yield_result, risk_result, market_result):
+    """
+    Returns:
+      composite_score   — 0‥100
+      verdict           — "Strongly Recommended" / "Recommended" /
+                          "Conditionally Recommended" / "Not Recommended"
+      verdict_color     — hex color
+      rationale         — list of str (bullet points for UI)
+      agent_scores      — dict of individual normalized scores (0‥1)
+    """
+    ml_norm    = ml_confidence_pct / 100
+    yield_norm = yield_result["yield_score"]          # already 0‥1
+    risk_norm  = 1.0 - risk_result["risk_score"]      # invert — less risk = better
+    market_norm = market_result["market_score"]       # already 0‥1
+
+    composite = (
+        FUSION_WEIGHTS["ml_confidence"] * ml_norm +
+        FUSION_WEIGHTS["yield_score"]   * yield_norm +
+        FUSION_WEIGHTS["market_score"]  * market_norm +
+        FUSION_WEIGHTS["risk_penalty"]  * risk_norm
+    )
+    composite_score = round(composite * 100, 1)
+
+    if composite_score >= 75:
+        verdict       = "Strongly Recommended"
+        verdict_color = "#4caf50"
+    elif composite_score >= 55:
+        verdict       = "Recommended"
+        verdict_color = "#8bc34a"
+    elif composite_score >= 38:
+        verdict       = "Conditionally Recommended"
+        verdict_color = "#ffa726"
+    else:
+        verdict       = "Not Recommended"
+        verdict_color = "#ef5350"
+
+    # Build rationale bullets
+    rationale = []
+    if ml_norm >= 0.8:
+        rationale.append("ML model shows high confidence — strong agro-climatic pattern match.")
+    elif ml_norm >= 0.6:
+        rationale.append("ML model shows moderate confidence — reasonable pattern match.")
+    else:
+        rationale.append("ML confidence is low — consider alternative crops from Top-3 list.")
+
+    if yield_norm >= 0.75:
+        rationale.append("Soil and climate conditions are highly favourable for this crop.")
+    elif yield_norm >= 0.50:
+        rationale.append("Soil/climate conditions are adequate; some parameter optimisation advised.")
+    else:
+        rationale.append("Suboptimal soil or climate conditions detected — yield may be reduced.")
+
+    if risk_result["risk_score"] < 0.25:
+        rationale.append("Risk profile is low — minimal pest, flood, and drought concerns.")
+    elif risk_result["risk_score"] < 0.50:
+        rationale.append("Moderate risk detected — implement IPM and water management protocols.")
+    else:
+        rationale.append("High risk level — strong mitigation measures required before proceeding.")
+
+    if market_result["market_score"] >= 0.70:
+        rationale.append(f"Market outlook is strong — MSP ₹{market_result['mspp']:,}/qtl, high demand.")
+    elif market_result["market_score"] >= 0.50:
+        rationale.append(f"Market conditions are fair — MSP ₹{market_result['mspp']:,}/qtl, moderate volatility.")
+    else:
+        rationale.append(f"Market outlook is uncertain — price volatility is {market_result['volatility'].lower()}; hedge before sowing.")
+
+    agent_scores = {
+        "ML Confidence":  round(ml_norm * 100, 1),
+        "Yield Score":    round(yield_norm * 100, 1),
+        "Risk Score":     round(risk_result["risk_score"] * 100, 1),
+        "Market Score":   round(market_norm * 100, 1),
+    }
+
+    return {
+        "composite_score": composite_score,
+        "verdict":         verdict,
+        "verdict_color":   verdict_color,
+        "rationale":       rationale,
+        "agent_scores":    agent_scores,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONVENIENCE: run all three agents + fusion in one call
+# ══════════════════════════════════════════════════════════════════════════════
+def run_all_agents(crop, season, soil_ph, nitrogen, phosphorus, potassium,
+                   rainfall, temperature, ml_confidence_pct, robustness_score):
+    ya = yield_agent(crop, season, soil_ph, nitrogen, phosphorus,
+                     potassium, rainfall, temperature)
+    ra = risk_agent(crop, rainfall, temperature, robustness_score)
+    ma = market_agent(crop, ya["yield_lo"], ya["yield_hi"])
+    fu = fusion_rule(ml_confidence_pct, ya, ra, ma)
+    return ya, ra, ma, fu
+# ─── CONSTANTS ───────────────────────────────────────────────────────────────
+PROJECT_TITLE = "An Adaptive, Uncertainty-Aware Decision Framework for Intelligent Crop Recommendation Under Dynamic Agricultural Conditions"
+PROJECT_SHORT = "Adaptive Crop Recommendation System"
+AUTHOR_NAME   = "Arjun Mishra"
+INSTITUTION   = "B.Tech Final Year Project · CSE Core · SDP Final Review"
 
 # ─── PDF REPORT GENERATOR ────────────────────────────────────────────────────
 def generate_pdf_report(
@@ -13,7 +410,6 @@ def generate_pdf_report(
     rainfall, temperature, best_crop, confidence,
     top3_crops, top3_probs, feature_names, importances,
     adv_title, adv_body,
-    # ── NEW: uncertainty / robustness params ──
     reliability_label="—", raw_entropy=0.0, norm_entropy=0.0,
     robustness_score=0.0, climate_sensitivity="—",
     risk_level="—", risk_flags=None
@@ -25,14 +421,14 @@ def generate_pdf_report(
         SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
     )
     from reportlab.lib.styles import ParagraphStyle
-    from reportlab.lib.enums import TA_CENTER, TA_RIGHT
+    from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
         leftMargin=2*cm, rightMargin=2*cm,
         topMargin=2*cm, bottomMargin=2*cm,
-        title="Crop Recommendation Report"
+        title=f"Crop Recommendation Report — {PROJECT_SHORT}"
     )
 
     # ── Colors ──
@@ -45,58 +441,61 @@ def generate_pdf_report(
     GRAY_LIGHT  = colors.HexColor("#eceff1")
     WHITE       = colors.white
     BLACK       = colors.HexColor("#1a1a1a")
+    NAVY        = colors.HexColor("#1a237e")
 
-    # ── Styles ──
     def S(name, **kw):
         return ParagraphStyle(name, **kw)
 
-    s_title = S("title",
-        fontSize=22, fontName="Helvetica-Bold",
-        textColor=WHITE, alignment=TA_CENTER, spaceAfter=2)
-    s_subtitle = S("subtitle",
-        fontSize=11, fontName="Helvetica",
-        textColor=colors.HexColor("#2e7b34"), alignment=TA_CENTER, spaceAfter=4)
-    s_section = S("section",
-        fontSize=12, fontName="Helvetica-Bold",
-        textColor=GREEN_DARK, spaceBefore=12, spaceAfter=6)
-    s_adv_title = S("adv_title",
-        fontSize=11, fontName="Helvetica-Bold",
-        textColor=colors.HexColor("#7a5c00"), spaceAfter=4)
-    s_adv_body = S("adv_body",
-        fontSize=10, fontName="Helvetica",
-        textColor=colors.HexColor("#5a4500"), leading=15)
+    s_title     = S("title",     fontSize=20, fontName="Helvetica-Bold",  textColor=WHITE,                     alignment=TA_CENTER, spaceAfter=2)
+    s_subtitle  = S("subtitle",  fontSize=9,  fontName="Helvetica",       textColor=colors.HexColor("#2e7b34"), alignment=TA_CENTER, spaceAfter=2)
+    s_author    = S("author",    fontSize=9,  fontName="Helvetica-Bold",  textColor=colors.HexColor("#1b5e20"), alignment=TA_CENTER, spaceAfter=4)
+    s_section   = S("section",   fontSize=12, fontName="Helvetica-Bold",  textColor=GREEN_DARK,                spaceBefore=12, spaceAfter=6)
+    s_adv_title = S("adv_title", fontSize=11, fontName="Helvetica-Bold",  textColor=colors.HexColor("#7a5c00"), spaceAfter=4)
+    s_adv_body  = S("adv_body",  fontSize=10, fontName="Helvetica",       textColor=colors.HexColor("#5a4500"), leading=15)
 
     story = []
 
     # ══════════════════════════════════════════════════════════════
     # HEADER BANNER
     # ══════════════════════════════════════════════════════════════
+    # Two-line header: icon+short line, then full project title below
+    s_banner_top = S("banner_top",
+        fontSize=11, fontName="Helvetica-Bold",
+        textColor=colors.HexColor("#a5d6a7"),
+        alignment=TA_CENTER, spaceAfter=4, leading=14)
+    s_banner_title = S("banner_title",
+        fontSize=13, fontName="Helvetica-Bold",
+        textColor=WHITE,
+        alignment=TA_CENTER, spaceAfter=0, leading=17)
+
     header_data = [[
-        Paragraph("🌱 Smart Crop Advisor", s_title),
+        Paragraph("🌱  Smart Crop Advisor  —  Adaptive AI Recommendation System", s_banner_top),
+    ],[
+        Paragraph(PROJECT_TITLE, s_banner_title),
     ]]
     header_table = Table(header_data, colWidths=[17*cm])
     header_table.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), GREEN_MID),
-        ("ROUNDEDCORNERS", [8]),
-        ("TOPPADDING",    (0,0), (-1,-1), 18),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 10),
+        ("BACKGROUND",    (0,0), (-1,-1), GREEN_MID),
+        ("TOPPADDING",    (0,0), (0,0),   14),
+        ("BOTTOMPADDING", (0,0), (0,0),   2),
+        ("TOPPADDING",    (0,1), (-1,-1), 2),
+        ("BOTTOMPADDING", (0,1), (-1,-1), 14),
         ("LEFTPADDING",   (0,0), (-1,-1), 16),
         ("RIGHTPADDING",  (0,0), (-1,-1), 16),
     ]))
     story.append(header_table)
-    story.append(Spacer(1, 6))
+    story.append(Spacer(1, 4))
 
-    # Sub-header row: university info + date
     now = datetime.now().strftime("%d %B %Y, %I:%M %p")
+
     sub_data = [[
-        Paragraph("B.Tech Final Year Project · CSE Core · SDP Final Review", s_subtitle),
+        Paragraph(f"Created by: {AUTHOR_NAME}  ·  {INSTITUTION}", s_author),
         Paragraph(f"Generated: {now}", S("dt",
-            fontSize=8.5, fontName="Helvetica",
-            textColor=GRAY, alignment=TA_RIGHT)),
+            fontSize=8.5, fontName="Helvetica", textColor=GRAY, alignment=TA_RIGHT)),
     ]]
     sub_tbl = Table(sub_data, colWidths=[12*cm, 5*cm])
     sub_tbl.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#f5f7f2")),
+        ("BACKGROUND",    (0,0), (-1,-1), colors.HexColor("#f5f7f2")),
         ("TOPPADDING",    (0,0), (-1,-1), 6),
         ("BOTTOMPADDING", (0,0), (-1,-1), 6),
         ("LEFTPADDING",   (0,0), (-1,-1), 10),
@@ -109,35 +508,28 @@ def generate_pdf_report(
     # ══════════════════════════════════════════════════════════════
     # RECOMMENDATION RESULT CARD
     # ══════════════════════════════════════════════════════════════
-    crop_icons = {"Rice":"🌾","Cotton":"🌿","Chilli":"🌶","Maize":"🌽","Groundnut":"🥜"}
-    icon = crop_icons.get(best_crop, "🌱")
-
-    conf_label = "High Confidence" if confidence >= 80 else ("Moderate Confidence" if confidence >= 60 else "Low Confidence")
+    crop_icons  = {"Rice":"🌾","Cotton":"🌿","Chilli":"🌶","Maize":"🌽","Groundnut":"🥜"}
+    icon        = crop_icons.get(best_crop, "🌱")
+    conf_label  = ("High Confidence" if confidence >= 80 else
+                   ("Moderate Confidence" if confidence >= 60 else "Low Confidence"))
 
     result_data = [
         [Paragraph(f"{icon}  Recommended Crop", S("rl",
-            fontSize=10, fontName="Helvetica",
-            textColor=colors.HexColor("#a5d6a7"))),
+             fontSize=10, fontName="Helvetica", textColor=colors.HexColor("#a5d6a7"))),
          Paragraph("Adaptive AI Confidence Score", S("rc",
-            fontSize=10, fontName="Helvetica",
-            textColor=colors.HexColor("#a5d6a7"), alignment=TA_RIGHT))],
+             fontSize=10, fontName="Helvetica", textColor=colors.HexColor("#a5d6a7"), alignment=TA_RIGHT))],
         [Paragraph(best_crop, S("rn",
-            fontSize=26, fontName="Helvetica-Bold",
-            textColor=WHITE)),
+             fontSize=26, fontName="Helvetica-Bold", textColor=WHITE)),
          Paragraph(f"{confidence:.1f}%", S("rpct",
-            fontSize=26, fontName="Helvetica-Bold",
-            textColor=WHITE, alignment=TA_RIGHT))],
+             fontSize=26, fontName="Helvetica-Bold", textColor=WHITE, alignment=TA_RIGHT))],
         [Paragraph(f"{district} · {season} season", S("rs",
-            fontSize=9, fontName="Helvetica",
-            textColor=colors.HexColor("#c8e6c9"))),
+             fontSize=9, fontName="Helvetica", textColor=colors.HexColor("#c8e6c9"))),
          Paragraph(conf_label, S("rcl",
-            fontSize=9, fontName="Helvetica-Bold",
-            textColor=WHITE, alignment=TA_RIGHT))],
+             fontSize=9, fontName="Helvetica-Bold", textColor=WHITE, alignment=TA_RIGHT))],
     ]
     result_table = Table(result_data, colWidths=[10*cm, 7*cm])
     result_table.setStyle(TableStyle([
         ("BACKGROUND",    (0,0), (-1,-1), GREEN_DARK),
-        ("ROUNDEDCORNERS",[10]),
         ("TOPPADDING",    (0,0), (-1,-1), 10),
         ("BOTTOMPADDING", (0,0), (-1,-1), 10),
         ("LEFTPADDING",   (0,0), (-1,-1), 18),
@@ -148,65 +540,62 @@ def generate_pdf_report(
     story.append(Spacer(1, 16))
 
     # ══════════════════════════════════════════════════════════════
-    # UNCERTAINTY & ROBUSTNESS ANALYSIS TABLE  (NEW SECTION)
+    # UNCERTAINTY & ROBUSTNESS ANALYSIS TABLE
     # ══════════════════════════════════════════════════════════════
     story.append(Paragraph("Uncertainty & Robustness Analysis", s_section))
     story.append(HRFlowable(width="100%", thickness=1, color=GREEN_LIGHT, spaceAfter=6))
 
-    risk_flags = risk_flags or []
-    risk_flag_text = "; ".join([f[2] for f in risk_flags]) if risk_flags else "None"
+    risk_flags      = risk_flags or []
+    risk_flag_text  = "; ".join([f[2] for f in risk_flags]) if risk_flags else "None"
 
-    # Helper: wrap every cell in Paragraph so text auto-wraps instead of overflowing
     def _P(text, bold=False, color=BLACK, size=8.5):
         return Paragraph(str(text), ParagraphStyle(
-            "cell", fontSize=size, fontName="Helvetica-Bold" if bold else "Helvetica",
+            "cell", fontSize=size,
+            fontName="Helvetica-Bold" if bold else "Helvetica",
             textColor=color, leading=11, wordWrap="LTR"
         ))
 
-    HDR = colors.HexColor("#1a237e")
     uncertainty_rows = [
-        [_P("Metric",                     bold=True, color=WHITE, size=8.5),
-         _P("Value",                      bold=True, color=WHITE, size=8.5),
-         _P("Interpretation",             bold=True, color=WHITE, size=8.5)],
+        [_P("Metric",                       bold=True, color=WHITE),
+         _P("Value",                        bold=True, color=WHITE),
+         _P("Interpretation",               bold=True, color=WHITE)],
         [_P("Adaptive AI Confidence Score"),
-         _P(f"{confidence:.1f}%",         bold=True),
-         _P("High (>80%), Moderate (60–80%), Low (<60%)")],
+         _P(f"{confidence:.1f}%",           bold=True),
+         _P("High (>80%), Moderate (60-80%), Low (<60%)")],
         [_P("Prediction Reliability"),
-         _P(reliability_label,            bold=True),
+         _P(reliability_label,              bold=True),
          _P("Derived from Shannon entropy of class probabilities")],
         [_P("Predictive Entropy (raw)"),
-         _P(f"{raw_entropy:.4f} nats",    bold=True),
+         _P(f"{raw_entropy:.4f} nats",      bold=True),
          _P("Low entropy = model is certain; High entropy = model is uncertain")],
         [_P("Normalised Entropy"),
-         _P(f"{norm_entropy:.3f}",        bold=True),
+         _P(f"{norm_entropy:.3f}",          bold=True),
          _P("0 = fully certain,  1 = maximally uncertain")],
         [_P("Robustness Score"),
          _P(f"{robustness_score*100:.0f}%", bold=True),
-         _P("% of 20 trials where top crop stayed the same under climate perturbation")],
+         _P("% of 20 trials where top crop stayed same under climate perturbation")],
         [_P("Climate Sensitivity"),
-         _P(climate_sensitivity,          bold=True),
+         _P(climate_sensitivity,            bold=True),
          _P("Sensitivity of recommendation to rainfall and temperature variation")],
         [_P("Overall Risk Level"),
-         _P(risk_level,                   bold=True),
+         _P(risk_level,                     bold=True),
          _P("Composite of confidence score + robustness flags")],
         [_P("Active Risk Flags"),
-         _P(risk_flag_text,               bold=True),
+         _P(risk_flag_text,                 bold=True),
          _P("Warnings triggered by threshold analysis")],
     ]
 
-    unc_table = Table(uncertainty_rows, colWidths=[5*cm, 3.2*cm, 8.8*cm],
-                      repeatRows=1)          # repeat header on page break
-    unc_style = [
-        ("BACKGROUND",    (0,0), (-1,0), HDR),
+    unc_table = Table(uncertainty_rows, colWidths=[5*cm, 3.2*cm, 8.8*cm], repeatRows=1)
+    unc_table.setStyle(TableStyle([
+        ("BACKGROUND",    (0,0), (-1,0), NAVY),
         ("ROWBACKGROUNDS",(0,1), (-1,-1), [WHITE, GRAY_LIGHT]),
         ("GRID",          (0,0), (-1,-1), 0.3, colors.HexColor("#ccc")),
         ("TOPPADDING",    (0,0), (-1,-1), 6),
         ("BOTTOMPADDING", (0,0), (-1,-1), 6),
         ("LEFTPADDING",   (0,0), (-1,-1), 8),
         ("RIGHTPADDING",  (0,0), (-1,-1), 8),
-        ("VALIGN",        (0,0), (-1,-1), "TOP"),   # TOP so wrapped lines align
-    ]
-    unc_table.setStyle(TableStyle(unc_style))
+        ("VALIGN",        (0,0), (-1,-1), "TOP"),
+    ]))
     story.append(unc_table)
     story.append(Spacer(1, 16))
 
@@ -217,15 +606,15 @@ def generate_pdf_report(
     story.append(HRFlowable(width="100%", thickness=1, color=GREEN_LIGHT, spaceAfter=6))
 
     params = [
-        ["Parameter", "Value", "Unit", "Optimal Range"],
-        ["District",    district,           "—",      "Andhra Pradesh"],
-        ["Season",      season,             "—",      "Kharif / Rabi / Zaid"],
-        ["Soil pH",     f"{soil_ph:.1f}",   "pH",     "6.0 – 7.5"],
-        ["Nitrogen",    str(nitrogen),      "kg/ha",  "40 – 80"],
-        ["Phosphorus",  str(phosphorus),    "kg/ha",  "20 – 60"],
-        ["Potassium",   str(potassium),     "kg/ha",  "30 – 70"],
-        ["Rainfall",    str(rainfall),      "mm",     "500 – 900"],
-        ["Temperature", f"{temperature:.1f}","°C",   "20 – 35"],
+        ["Parameter",   "Value",              "Unit",  "Optimal Range"],
+        ["District",    district,             "—",     "Andhra Pradesh"],
+        ["Season",      season,               "—",     "Kharif / Rabi / Zaid"],
+        ["Soil pH",     f"{soil_ph:.1f}",     "pH",    "6.0 – 7.5"],
+        ["Nitrogen",    str(nitrogen),        "kg/ha", "40 – 80"],
+        ["Phosphorus",  str(phosphorus),      "kg/ha", "20 – 60"],
+        ["Potassium",   str(potassium),       "kg/ha", "30 – 70"],
+        ["Rainfall",    str(rainfall),        "mm",    "500 – 900"],
+        ["Temperature", f"{temperature:.1f}", "°C",    "20 – 35"],
     ]
     param_table = Table(params, colWidths=[4.5*cm, 3.5*cm, 2.5*cm, 6.5*cm])
     param_table.setStyle(TableStyle([
@@ -253,17 +642,12 @@ def generate_pdf_report(
     story.append(Paragraph("Top 3 Crop Recommendations", s_section))
     story.append(HRFlowable(width="100%", thickness=1, color=GREEN_LIGHT, spaceAfter=6))
 
-    medals = ["🥇", "🥈", "🥉"]
+    medals   = ["#1", "#2", "#3"]
     rec_rows = [["Rank", "Crop", "Probability", "Confidence Bar"]]
     for i in range(3):
         bar_pct = int(top3_probs[i] * 100)
         bar = "█" * (bar_pct // 5) + "░" * (20 - bar_pct // 5)
-        rec_rows.append([
-            f"{medals[i]} #{i+1}",
-            top3_crops[i],
-            f"{bar_pct}%",
-            bar[:20]
-        ])
+        rec_rows.append([f"{medals[i]}", top3_crops[i], f"{bar_pct}%", bar[:20]])
 
     rec_table = Table(rec_rows, colWidths=[2.5*cm, 4.5*cm, 3*cm, 7*cm])
     rec_table.setStyle(TableStyle([
@@ -300,10 +684,7 @@ def generate_pdf_report(
         "Potassium":"Potassium","Rainfall":"Rainfall","Temperature":"Temperature",
         "District":"District","Season":"Season"
     }
-    feat_data = sorted(
-        zip(feature_names, importances), key=lambda x: x[1], reverse=True
-    )
-    imp_rows = [["Feature", "Importance Score", "Visual", "Interpretation"]]
+    feat_data = sorted(zip(feature_names, importances), key=lambda x: x[1], reverse=True)
     interpretations = {
         "Rainfall":    "Primary water availability indicator",
         "Temperature": "Crop thermal requirement factor",
@@ -314,6 +695,7 @@ def generate_pdf_report(
         "District":    "Region-specific agro-climatic zone",
         "Season":      "Seasonal sowing window suitability",
     }
+    imp_rows = [["Feature", "Importance Score", "Visual", "Interpretation"]]
     for feat, imp in feat_data:
         bar = "█" * int(imp * 100 // 5) + "░" * (20 - int(imp * 100 // 5))
         imp_rows.append([
@@ -348,15 +730,11 @@ def generate_pdf_report(
     story.append(Paragraph("Agronomic Advisory", s_section))
     story.append(HRFlowable(width="100%", thickness=1, color=GREEN_LIGHT, spaceAfter=6))
 
-    adv_data = [[
-        Paragraph(f"💡  {adv_title}", s_adv_title),
-    ],[
-        Paragraph(adv_body, s_adv_body),
-    ]]
+    adv_data = [[Paragraph(f"  {adv_title}", s_adv_title)],
+                [Paragraph(adv_body, s_adv_body)]]
     adv_table = Table(adv_data, colWidths=[17*cm])
     adv_table.setStyle(TableStyle([
         ("BACKGROUND",    (0,0), (-1,-1), AMBER_PALE),
-        ("ROUNDEDCORNERS",[8]),
         ("LEFTPADDING",   (0,0), (-1,-1), 14),
         ("RIGHTPADDING",  (0,0), (-1,-1), 14),
         ("TOPPADDING",    (0,0), (0,0),   10),
@@ -382,7 +760,9 @@ def generate_pdf_report(
         ["Imbalance Fix",  "SMOTE over-sampling (random_state=42)"],
         ["Eval Metric",    "mlogloss (multi-class log loss)"],
         ["Dataset",        "ap_crop_dataset_for_faculty.csv"],
-        ["Features",       ", ".join([label_map.get(f,f) for f in feature_names])],
+        ["Features",       ", ".join([label_map.get(f, f) for f in feature_names])],
+        ["Developed by",   AUTHOR_NAME],
+        ["Project",        PROJECT_SHORT],
     ]
     info_table = Table(model_params, colWidths=[4.5*cm, 12.5*cm])
     info_table.setStyle(TableStyle([
@@ -405,18 +785,19 @@ def generate_pdf_report(
     # ══════════════════════════════════════════════════════════════
     # FOOTER
     # ══════════════════════════════════════════════════════════════
+    footer_text = (
+        f"{PROJECT_SHORT}  |  {INSTITUTION}  |  "
+        f"Created by {AUTHOR_NAME}  |  Powered by XGBoost + SMOTE + Streamlit"
+    )
     footer_data = [[
-        Paragraph(
-            "B.Tech Final Year Project — Smart Crop Recommendation System  |  "
-            "CSE Core  |  SDP Final Review  |  Powered by XGBoost + SMOTE + Streamlit",
-            S("ft", fontSize=8, fontName="Helvetica", textColor=WHITE, alignment=TA_CENTER)
-        )
+        Paragraph(footer_text, S("ft",
+            fontSize=8, fontName="Helvetica", textColor=WHITE, alignment=TA_CENTER))
     ]]
     footer_table = Table(footer_data, colWidths=[17*cm])
     footer_table.setStyle(TableStyle([
         ("BACKGROUND",    (0,0), (-1,-1), GREEN_DARK),
-        ("TOPPADDING",    (0,0), (-1,-1), 8),
-        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+        ("TOPPADDING",    (0,0), (-1,-1), 10),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 10),
         ("LEFTPADDING",   (0,0), (-1,-1), 10),
         ("RIGHTPADDING",  (0,0), (-1,-1), 10),
     ]))
@@ -438,7 +819,6 @@ st.set_page_config(
 # ─── CSS ─────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* ── Full-page background ── */
 .stApp {
     background-image:
         linear-gradient(rgba(10,30,10,0.70), rgba(10,30,10,0.80)),
@@ -447,13 +827,10 @@ st.markdown("""
     background-position: center;
     background-attachment: fixed;
 }
-
-/* ── Typography on dark bg ── */
 h1, h2, h3, h4, h5 { color: #ffffff !important; }
 label, p, .stMarkdown p { color: #d9efd2 !important; }
 .stSlider label { color: #d9efd2 !important; }
 
-/* ── Cards ── */
 .card {
     background: rgba(255,255,255,0.07);
     border: 1px solid rgba(255,255,255,0.12);
@@ -470,8 +847,6 @@ label, p, .stMarkdown p { color: #d9efd2 !important; }
     color: #81c784 !important;
     margin-bottom: 0.8rem;
 }
-
-/* ── Result banner ── */
 .result-banner {
     background: linear-gradient(135deg, #1b5e20, #388e3c);
     border-radius: 16px;
@@ -486,8 +861,6 @@ label, p, .stMarkdown p { color: #d9efd2 !important; }
 .crop-sub { font-size: 0.78rem; color: #a5d6a7; text-transform: uppercase; letter-spacing: 0.08em; }
 .conf-pct { font-size: 2.6rem; font-weight: 800; color: #fff; text-align: right; }
 .conf-lbl { font-size: 0.78rem; color: #a5d6a7; text-align: right; }
-
-/* ── Metric pill ── */
 .metric-pill {
     display: inline-block;
     background: rgba(255,255,255,0.1);
@@ -498,8 +871,6 @@ label, p, .stMarkdown p { color: #d9efd2 !important; }
     color: #d9efd2;
     margin: 3px 4px 3px 0;
 }
-
-/* ── Advisory ── */
 .advisory {
     background: rgba(249,168,37,0.15);
     border: 1px solid rgba(249,168,37,0.4);
@@ -509,13 +880,9 @@ label, p, .stMarkdown p { color: #d9efd2 !important; }
 }
 .advisory .adv-title { font-weight: 700; color: #ffe082 !important; font-size: 0.9rem; }
 .advisory .adv-body  { color: #fff9c4 !important; font-size: 0.85rem; line-height: 1.6; }
-
-/* ── Badges ── */
 .badge-h { background:#1b5e20; color:#a5d6a7; border-radius:999px; padding:3px 12px; font-size:0.75rem; font-weight:700; display:inline-block; border:1px solid #4caf50; }
 .badge-m { background:#0d3a75; color:#90caf9; border-radius:999px; padding:3px 12px; font-size:0.75rem; font-weight:700; display:inline-block; border:1px solid #42a5f5; }
 .badge-l { background:#7a4a00; color:#ffe082; border-radius:999px; padding:3px 12px; font-size:0.75rem; font-weight:700; display:inline-block; border:1px solid #ffa000; }
-
-/* ── Project badge ── */
 .project-badge {
     background: rgba(255,255,255,0.06);
     border: 1px solid rgba(255,255,255,0.15);
@@ -527,11 +894,7 @@ label, p, .stMarkdown p { color: #d9efd2 !important; }
     margin-right: 6px;
     margin-bottom: 4px;
 }
-
-/* ── Section divider ── */
 .sdiv { border: none; border-top: 1px solid rgba(255,255,255,0.1); margin: 1rem 0; }
-
-/* ── Project subtitle ── */
 .project-subtitle {
     font-size: 0.85rem;
     color: #81c784 !important;
@@ -539,8 +902,17 @@ label, p, .stMarkdown p { color: #d9efd2 !important; }
     margin: 6px 0 10px 0;
     font-style: italic;
 }
-
-/* ── Metric cards row (uncertainty / robustness) ── */
+/* Author credit strip */
+.author-strip {
+    background: rgba(27,94,32,0.35);
+    border: 1px solid rgba(76,175,80,0.3);
+    border-radius: 8px;
+    padding: 5px 14px;
+    font-size: 0.78rem;
+    color: #a5d6a7 !important;
+    display: inline-block;
+    margin-bottom: 8px;
+}
 .metric-cards-row { display: flex; gap: 12px; margin: 1rem 0; flex-wrap: wrap; }
 .metric-card {
     flex: 1; min-width: 140px;
@@ -553,8 +925,6 @@ label, p, .stMarkdown p { color: #d9efd2 !important; }
 .metric-card .mc-label { font-size: 0.68rem; color: #81c784 !important; text-transform: uppercase; letter-spacing: 0.08em; }
 .metric-card .mc-value { font-size: 1.15rem; font-weight: 700; color: #ffffff !important; margin-top: 2px; }
 .metric-card .mc-sub   { font-size: 0.72rem; color: #a5d6a7 !important; margin-top: 2px; }
-
-/* ── Entropy / reliability panel ── */
 .entropy-panel {
     background: rgba(30,60,100,0.35);
     border: 1px solid rgba(100,160,255,0.3);
@@ -563,20 +933,14 @@ label, p, .stMarkdown p { color: #d9efd2 !important; }
 .entropy-panel .ep-title { font-size: 0.72rem; color: #90caf9 !important; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
 .entropy-panel .ep-score { font-size: 1.6rem; font-weight: 800; color: #fff !important; }
 .entropy-panel .ep-label { font-size: 0.82rem; color: #90caf9 !important; margin-top: 2px; }
-
-/* ── Risk warning banners ── */
 .risk-banner { border-radius: 10px; padding: 0.75rem 1.1rem; margin: 6px 0; display: flex; align-items: flex-start; gap: 10px; }
 .risk-banner.risk-low-conf  { background: rgba(183,28,28,0.25); border: 1px solid rgba(229,115,115,0.5); }
 .risk-banner.risk-climate   { background: rgba(230,81,0,0.25);  border: 1px solid rgba(255,183,77,0.5); }
 .risk-banner .rb-icon  { font-size: 1.1rem; margin-top: 1px; }
 .risk-banner .rb-title { font-size: 0.82rem; font-weight: 700; color: #fff !important; }
 .risk-banner .rb-body  { font-size: 0.77rem; color: rgba(255,255,255,0.75) !important; margin-top: 2px; line-height: 1.4; }
-
-/* ── Robustness bar ── */
 .robust-bar-wrap { background: rgba(255,255,255,0.1); border-radius: 999px; height: 10px; margin: 6px 0 2px; overflow: hidden; }
 .robust-bar-fill { height: 100%; border-radius: 999px; background: linear-gradient(90deg, #ef9a9a, #a5d6a7); transition: width 0.6s; }
-
-/* ── Streamlit widget overrides ── */
 .stSelectbox > div > div { background: rgba(255,255,255,0.08) !important; border: 1px solid rgba(255,255,255,0.2) !important; border-radius: 8px !important; color: #fff !important; }
 .stButton > button {
     background: linear-gradient(135deg, #2e7d32, #43a047) !important;
@@ -650,9 +1014,14 @@ CROP_ICONS = {"Rice":"🌾","Cotton":"🌿","Chilli":"🌶️","Maize":"🌽","G
 
 
 # ─── HEADER ──────────────────────────────────────────────────────────────────
-st.markdown("# 🌱 An Adaptive, Uncertainty-Aware Decision Framework for Intelligent Crop Recommendation Under Dynamic Agricultural Conditions")
+st.markdown(f"# 🌱 {PROJECT_TITLE}")
 st.markdown(
     '<p class="project-subtitle">Adaptive AI &nbsp;•&nbsp; Uncertainty-Aware Prediction &nbsp;•&nbsp; Explainable Recommendation System</p>',
+    unsafe_allow_html=True
+)
+# Author credit visible in the UI
+st.markdown(
+    f'<span class="author-strip">👤 Created by {AUTHOR_NAME}</span>',
     unsafe_allow_html=True
 )
 st.markdown(
@@ -701,36 +1070,25 @@ with right:
 
 # ─── UNCERTAINTY / ENTROPY HELPER ───────────────────────────────────────────
 def compute_entropy(probs):
-    """Shannon entropy over class probabilities.
-    Low entropy  → model is certain  → High reliability
-    High entropy → model is spread   → Low reliability
-    Max possible entropy for N classes = log(N)
-    """
-    eps = 1e-12                          # avoid log(0)
+    eps = 1e-12
     raw = -np.sum(probs * np.log(probs + eps))
     n_classes = len(probs)
-    max_entropy = np.log(n_classes)      # normalise to [0,1]
+    max_entropy = np.log(n_classes)
     normalised  = raw / max_entropy if max_entropy > 0 else 0.0
     return round(raw, 4), round(normalised, 4)
 
 def entropy_to_reliability(normalised_entropy):
-    """Convert normalised entropy → reliability label + colour."""
     if normalised_entropy < 0.35:
-        return "High",   "#4caf50"    # green
+        return "High",   "#4caf50"
     elif normalised_entropy < 0.65:
-        return "Medium", "#ffa726"    # amber
+        return "Medium", "#ffa726"
     else:
-        return "Low",    "#ef5350"    # red
+        return "Low",    "#ef5350"
 
 
 # ─── ROBUSTNESS / CLIMATE SENSITIVITY HELPER ────────────────────────────────
 def compute_robustness(model, base_input_df, le_district, le_season,
                        best_crop, le_crop, n_trials=20):
-    """Lightweight counterfactual robustness test.
-    Perturbs rainfall (±10 %) and temperature (±2 °C) n_trials times,
-    re-runs prediction each time, and returns the fraction of trials
-    where the top-recommended crop stays the same.
-    """
     rng  = np.random.default_rng(seed=42)
     same = 0
     rain_val = float(base_input_df["Rainfall"].iloc[0])
@@ -745,8 +1103,7 @@ def compute_robustness(model, base_input_df, le_district, le_season,
         if trial_best == best_crop:
             same += 1
 
-    robustness = same / n_trials           # 0.0 – 1.0
-    # Climate sensitivity: inverse of robustness
+    robustness = same / n_trials
     if robustness >= 0.85:
         climate_sens = "Low"
     elif robustness >= 0.65:
@@ -758,7 +1115,6 @@ def compute_robustness(model, base_input_df, le_district, le_season,
 
 # ─── RISK FLAG HELPER ────────────────────────────────────────────────────────
 def get_risk_flags(confidence_pct, robustness_score):
-    """Return list of active risk flags as (css_class, icon, title, body)."""
     flags = []
     if confidence_pct < 40:
         flags.append((
@@ -800,26 +1156,35 @@ if predict_btn:
     adv_title, adv_body = ADVISORIES.get(best_crop,
         ("Follow standard practices","Consult your local agricultural extension officer."))
 
-    # ── Uncertainty analysis ──
     raw_entropy, norm_entropy = compute_entropy(probs)
     reliability_label, reliability_color = entropy_to_reliability(norm_entropy)
 
-    # ── Robustness testing (lightweight, 20 trials) ──
     robustness_score, climate_sensitivity = compute_robustness(
         model, inp, le_district, le_season, best_crop, le_crop, n_trials=20
     )
     robustness_pct = robustness_score * 100
+        # ─── MULTI AGENT SYSTEM ─────────────────────────────
+    yield_result, risk_result, market_result, fusion_result = run_all_agents(
+        crop=best_crop,
+        season=season,
+        soil_ph=soil_ph,
+        nitrogen=nitrogen,
+        phosphorus=phosphorus,
+        potassium=potassium,
+        rainfall=rainfall,
+        temperature=temperature,
+        ml_confidence_pct=confidence,
+        robustness_score=robustness_score
+    )
 
-    # ── Risk flags ──
     risk_flags = get_risk_flags(confidence, robustness_score)
 
-    # ── Derived risk level label ──
     if len(risk_flags) == 0:
         risk_level, risk_color = "Low Risk",    "#4caf50"
     elif len(risk_flags) == 1:
         risk_level, risk_color = "Medium Risk", "#ffa726"
     else:
-        risk_level, risk_color = "High Risk",   "#ef5350" 
+        risk_level, risk_color = "High Risk",   "#ef5350"
 
     st.markdown('<hr class="sdiv">', unsafe_allow_html=True)
     st.markdown("## Recommendation Results")
@@ -831,7 +1196,6 @@ if predict_btn:
     else:
         conf_badge = '<span class="badge-l">⚠ Low Confidence</span>'
 
-    # ── Result banner ──
     st.markdown(f"""
     <div class="result-banner">
       <div>
@@ -847,7 +1211,6 @@ if predict_btn:
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Summary pills ──
     st.markdown(
         f'<span class="metric-pill">pH {soil_ph:.1f}</span>'
         f'<span class="metric-pill">N {nitrogen} kg/ha</span>'
@@ -861,7 +1224,6 @@ if predict_btn:
 
     st.write("")
 
-    # ── Uncertainty & Robustness Metric Cards ──────────────────────────────────
     st.markdown(f"""
     <div class="metric-cards-row">
       <div class="metric-card">
@@ -891,7 +1253,6 @@ if predict_btn:
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Risk Warning Banners (shown only when triggered) ───────────────────────
     for css_cls, rb_icon, rb_title, rb_body in risk_flags:
         st.markdown(f"""
         <div class="risk-banner {css_cls}">
@@ -905,7 +1266,6 @@ if predict_btn:
 
     st.write("")
 
-    # ── Three-column output ──
     c1, c2, c3 = st.columns([1.2, 1, 1], gap="medium")
 
     with c1:
@@ -916,8 +1276,6 @@ if predict_btn:
             st.markdown(f"**{medal} {crop}** &nbsp; `{pct:.1f}%`")
             st.progress(int(pct))
         st.write("")
-
-        # Crop image
         if best_crop in CROP_IMAGES:
             st.markdown(f"**{icon} {best_crop} — Field Image**")
             st.image(CROP_IMAGES[best_crop], use_container_width=True,
@@ -940,7 +1298,6 @@ if predict_btn:
         top3_feat = feat_df["Feature"].head(3).tolist()
         st.caption(f"Key drivers: **{', '.join(top3_feat)}**")
 
-        # Entropy detail under chart
         st.markdown(f"""
         <div class="entropy-panel">
           <div class="ep-title">&#x1F4CA; Predictive Entropy (Uncertainty Measure)</div>
@@ -960,7 +1317,6 @@ if predict_btn:
 
         st.write("")
 
-        # Robustness bar
         st.markdown(f"""
         <div style="margin-bottom:8px">
           <div style="font-size:0.72rem;color:#81c784;text-transform:uppercase;letter-spacing:0.08em">
@@ -974,7 +1330,6 @@ if predict_btn:
         </div>
         """, unsafe_allow_html=True)
 
-        # Full probability expander
         with st.expander("📋 All crops probability table"):
             all_crops = le_crop.classes_
             prob_df = (
@@ -984,6 +1339,59 @@ if predict_btn:
             )
             prob_df.index += 1
             st.dataframe(prob_df, use_container_width=True)
+                # ─── MULTI AGENT DECISION FRAMEWORK ─────────────────────────────
+
+    st.markdown('<hr class="sdiv">', unsafe_allow_html=True)
+    st.markdown("## 🤖 Multi-Agent Decision Framework")
+
+    st.markdown(f"""
+    <div class="result-banner">
+      <div>
+        <div class="crop-sub">Composite Decision Score</div>
+        <div class="crop-big">🧠 {fusion_result['composite_score']}%</div>
+        <div style="margin-top:8px">
+            <span class="badge-h">{fusion_result['verdict']}</span>
+        </div>
+      </div>
+      <div>
+        <div class="conf-lbl">Fusion-Based Agricultural Intelligence</div>
+        <div class="conf-pct">{fusion_result['composite_score']}%</div>
+        <div class="conf-lbl">Yield + Risk + Market + ML</div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    ag1, ag2, ag3 = st.columns(3)
+
+    with ag1:
+        st.markdown("### 🌾 Yield Agent")
+        st.metric(
+            "Expected Yield",
+            f"{yield_result['yield_lo']} - {yield_result['yield_hi']} q/acre"
+        )
+        st.write(f"Suitability Score: {yield_result['yield_score']*100:.1f}%")
+
+    with ag2:
+        st.markdown("### ⚠️ Risk Agent")
+        st.metric(
+            "Risk Grade",
+            risk_result['risk_grade']
+        )
+        st.write(f"Risk Score: {risk_result['risk_score']*100:.1f}%")
+
+    with ag3:
+        st.markdown("### 💰 Market Agent")
+        st.metric(
+            "MSP",
+            f"₹{market_result['mspp']}/qtl"
+        )
+        st.write(f"Demand: {market_result['demand']}")
+        st.write(f"Export Potential: {market_result['export_potential']}")
+
+    st.markdown("### 📌 Fusion Rationale")
+
+    for point in fusion_result["rationale"]:
+        st.write(f"• {point}")
 
     # ── PDF Download ──
     st.markdown('<hr class="sdiv">', unsafe_allow_html=True)
@@ -994,7 +1402,6 @@ if predict_btn:
         rainfall, temperature, best_crop, confidence,
         top3_crops, top3_probs, feature_names, model.feature_importances_,
         adv_title, adv_body,
-        # uncertainty / robustness params
         reliability_label=reliability_label,
         raw_entropy=raw_entropy,
         norm_entropy=norm_entropy,
@@ -1026,10 +1433,10 @@ if predict_btn:
 # ─── FOOTER ──────────────────────────────────────────────────────────────────
 st.markdown(
     "<hr style='border-color:rgba(255,255,255,0.1)'>"
-    "<p style='text-align:center;font-size:0.75rem;color:rgba(255,255,255,0.4)'>"
-    "B.Tech Final Year Project · CSE Core · SDP Final Review &nbsp;|&nbsp; "
-    "Adaptive AI · Uncertainty-Aware · Explainable Recommendation System &nbsp;|&nbsp; "
-    "Recommendation generated using adaptive machine learning analysis."
-    "</p>",
+    f"<p style='text-align:center;font-size:0.75rem;color:rgba(255,255,255,0.4)'>"
+    f"{INSTITUTION} &nbsp;|&nbsp; "
+    f"Adaptive AI · Uncertainty-Aware · Explainable Recommendation System &nbsp;|&nbsp; "
+    f"Created by <strong style='color:rgba(255,255,255,0.6)'>{AUTHOR_NAME}</strong>"
+    f"</p>",
     unsafe_allow_html=True
 )
